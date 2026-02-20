@@ -1,0 +1,178 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: PDC Minimalist Infrastructure - Fargate & DynamoDB
+
+Resources:
+  # --- Network Infrastructure ---
+  PDCVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  PDCPublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PDCVPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+
+  # --- Database: DynamoDB (On-Demand Pricing) ---
+  PDCDonutTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: PDC-Inventory
+      AttributeDefinitions:
+        - AttributeName: ItemID
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ItemID # Partition Key
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST # Best for minimal/fluctuating traffic
+
+  # --- IAM Role for Fargate to Access DynamoDB ---
+  FargateTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: DynamoDBReadAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !GetAtt PDCDonutTable.Arn
+
+  # --- Fargate Infrastructure ---
+  FargateCluster: # defines what infastructure (compute) can hold the containers. In EC2 or External mode they are attached here
+    Type: AWS::ECS::Cluster
+
+  # below 2 resources are used if the launch type is EC2 (not needed for fargate)
+
+  # # --- 2. EC2 Launch Template (The Attachment) ---
+  # PDCLaunchTemplate:
+  #   Type: AWS::EC2::LaunchTemplate
+  #   Properties:
+  #     LaunchTemplateData:
+  #       ImageId: ami-0c55b159cbfafe1f0 # Update to your region's ECS-Optimized AMI
+  #       InstanceType: t3.micro
+  #       IamInstanceProfile:
+  #         Name: !Ref PDCInstanceProfile
+  #       # THIS ATTACHES THE EC2 TO THE CLUSTER
+  #       UserData:
+  #         Fn::Base64: !Sub |
+  #           #!/bin/bash
+  #           echo ECS_CLUSTER=${PDCCluster} >> /etc/ecs/ecs.config
+
+  # # --- 3. Auto Scaling Group ---
+  # PDCASG:
+  #   Type: AWS::AutoScaling::AutoScalingGroup
+  #   Properties:
+  #     VPCZoneIdentifier: [!Ref PublicSubnetID]
+  #     LaunchTemplate:
+  #       LaunchTemplateId: !Ref PDCLaunchTemplate
+  #       Version: !GetAtt PDCLaunchTemplate.LatestVersionNumber
+  #     MinSize: '1'
+  #     MaxSize: '2'
+  #     DesiredCapacity: '1'
+
+  PDCAppTask: # recipe with which to create containers
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      TaskRoleArn: !Ref FargateTaskRole # Grants permission to talk to DynamoDB
+      ContainerDefinitions:
+        - Name: pdc-app
+          Image: nginx:latest
+          Environment:
+            - Name: TABLE_NAME
+              Value: !Ref PDCDonutTable
+          PortMappings:
+            - ContainerPort: 80
+          # HealthCheck:
+          #   Command: ["CMD-SHELL", "curl -f http://localhost/health || exit 1"]
+          #   Interval: 30
+          #   Timeout: 5
+          #   Retries: 3
+          #   StartPeriod: 60
+          # - HostPort : 80 # for EC2 launch type. only allows one container per instance
+          # - HostPort : 0 # for EC2 launch type. uses dynamic port mapping to allow many containers per instance
+
+  PDCService: # manages tasks (containers), is the control node
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref FargateCluster
+      TaskDefinition: !Ref PDCAppTask
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref PDCPublicSubnet
+      # load balancer is for EC2 launch type
+      # LoadBalancers:
+      # - ContainerName: "donut-app"
+      #   ContainerPort: 80
+      #   TargetGroupArn: !Ref PDCTargetGroup
+
+  WebsiteS3:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: pdc-website-assets-123456789
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true # blocks new public ACLs and ignores any existing public ACLs on the bucket
+        BlockPublicPolicy: true # blocks new and existing public policies on the bucket
+        IgnorePublicAcls: true # ignores any public ACLs on the bucket and objects
+        RestrictPublicBuckets: true # restricts access to the bucket to only AWS services (CloudFront) and authed users
+
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Description: "OAC for S3 Website"
+        Name: pdc-donuts-OAC
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  WebCloudFront:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt WebsiteS3.RegionalDomainName
+            OriginAccessControlId: !Ref CloudFrontOAC # limits access to the S3 bucket to the cloudfront distribution authorized by the OAC
+            # S3OriginConfig:
+        Enabled: true
+        DefaultRootObject: index.html # serve index.html file when hitting the S3 bucket URL
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none

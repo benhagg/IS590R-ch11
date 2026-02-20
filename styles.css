@@ -1,0 +1,110 @@
+:root {
+  color-scheme: light;
+  --bg: #f7f3e8;
+  --ink: #1f1b16;
+  --accent: #c2472b;
+  --accent-soft: #f6d9c7;
+  --panel: #ffffff;
+  --muted: #7a6b5b;
+  --border: #e6d8c8;
+  --shadow: 0 10px 30px rgba(31, 27, 22, 0.08);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Frank Ruhl Libre", "Merriweather", serif;
+  background: radial-gradient(circle at 10% 10%, #f9efe3 0%, #f7f3e8 35%, #f0e9db 100%);
+  color: var(--ink);
+}
+
+.page {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 48px 20px 64px;
+  display: grid;
+  gap: 28px;
+}
+
+.hero {
+  background: var(--panel);
+  padding: 28px 32px;
+  border-radius: 18px;
+  box-shadow: var(--shadow);
+  border: 1px solid var(--border);
+}
+
+.hero h1 {
+  margin: 0 0 8px;
+  font-size: 2.4rem;
+  letter-spacing: -0.02em;
+}
+
+.hero p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.panel {
+  background: var(--panel);
+  border-radius: 16px;
+  padding: 24px 28px;
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+}
+
+.panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.status {
+  font-size: 0.9rem;
+  color: var(--muted);
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+}
+
+.pill-list {
+  list-style: none;
+  padding: 0;
+  margin: 12px 0 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.pill-list li {
+  background: var(--accent-soft);
+  color: var(--ink);
+  padding: 6px 12px;
+  border-radius: 999px;
+  font-size: 0.95rem;
+}
+
+.results {
+  margin: 12px 0 0;
+  min-height: 160px;
+  background: #1a1410;
+  color: #f4eee7;
+  padding: 16px;
+  border-radius: 12px;
+  overflow-x: auto;
+  font-size: 0.9rem;
+}
+
+@media (max-width: 640px) {
+  .page {
+    padding: 32px 16px 48px;
+  }
+
+  .hero h1 {
+    font-size: 2rem;
+  }
+}
