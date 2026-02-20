@@ -215,6 +215,7 @@ Resources:
                   - logs:CreateLogGroup
                   - logs:CreateLogStream
                   - logs:PutLogEvents
+                  - s3:GetObject
                 Resource: "*"
 
   # --- ECR Repository ---
@@ -366,7 +367,7 @@ Resources:
               Configuration:
                 Owner: benhagg
                 Repo: IS590R-ch11
-                Branch: main
+                Branch: master
                 OAuthToken: !Ref GitHubOAuthToken
               OutputArtifacts:
                 - Name: SourceOutput
@@ -668,7 +669,8 @@ Resources:
           - Id: S3Origin
             DomainName: !GetAtt WebsiteS3.RegionalDomainName
             OriginAccessControlId: !Ref CloudFrontOAC # limits access to the S3 bucket to the cloudfront distribution authorized by the OAC
-            S3OriginConfig: {}
+            S3OriginConfig:
+              OriginAccessIdentity: "" # Required by CloudFormation, empty string when using OAC
         Enabled: true
         DefaultRootObject: index.html # serve index.html file when hitting the S3 bucket URL
         DefaultCacheBehavior:
