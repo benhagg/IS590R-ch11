@@ -1,6 +1,12 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: PDC Minimalist Infrastructure - Fargate & DynamoDB
 
+Parameters:
+  GitHubOAuthToken:
+    Type: String
+    Description: GitHub OAuth token with repo access for CodePipeline source stage
+    NoEcho: true # hides the value in the CloudFormation console and API responses
+
 Resources:
   # --- Network Infrastructure ---
   PDCVPC:
@@ -16,6 +22,137 @@ Resources:
       VpcId: !Ref PDCVPC
       CidrBlock: 10.0.1.0/24
       MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs ""]
+
+  # --- Internet Gateway ---
+  PDCInternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref PDCVPC
+      InternetGatewayId: !Ref PDCInternetGateway
+
+  # --- Route Table for Public Subnet ---
+  PDCPublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref PDCVPC
+
+  PDCPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PDCPublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0 # any non-local traffic goes to this route
+      GatewayId: !Ref PDCInternetGateway #exit point of this route
+
+  PDCSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PDCPublicSubnet
+      RouteTableId: !Ref PDCPublicRouteTable
+
+  # --- Private Subnet for Fargate (API containers run here) ---
+  PDCPrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PDCVPC
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: false # Private subnet - no public IPs
+      AvailabilityZone: !Select [0, !GetAZs ""]
+
+  # --- Elastic IP for NAT Gateway ---
+  # PDCNATGatewayEIP:
+  #   Type: AWS::EC2::EIP
+  #   DependsOn: AttachGateway
+  #   Properties:
+  #     Domain: vpc
+
+  # --- NAT Gateway (in public subnet for private subnet internet access) ---
+  # PDCNATGateway:
+  #   Type: AWS::EC2::NatGateway
+  #   Properties:
+  #     AllocationId: !GetAtt PDCNATGatewayEIP.AllocationId
+  #     SubnetId: !Ref PDCPublicSubnet # NAT must be in public subnet
+
+  # --- Route Table for Private Subnet ---
+  PDCPrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref PDCVPC
+
+  # Route private subnet traffic to NAT Gateway (for ECR pulls, CloudWatch logs)
+  # PDCPrivateRoute:
+  #   Type: AWS::EC2::Route
+  #   Properties:
+  #     RouteTableId: !Ref PDCPrivateRouteTable
+  #     DestinationCidrBlock: 0.0.0.0/0
+  #     NatGatewayId: !Ref PDCNATGateway #forward all private subnet traffic to NAT for internet access
+
+  PDCPrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PDCPrivateSubnet
+      RouteTableId: !Ref PDCPrivateRouteTable
+
+  # --- DynamoDB Gateway Endpoint (private containers can access DynamoDB without NAT) ---
+  PDCDynamoDBEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref PDCVPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.dynamodb" # DynamoDB endpoint for this region
+      RouteTableIds:
+        - !Ref PDCPrivateRouteTable # Only private subnet needs this route
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:Query
+              - dynamodb:Scan
+              - dynamodb:BatchGetItem
+            Resource: !GetAtt PDCDonutTable.Arn
+
+  # --- Security Groups ---
+  PDCNLBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Network Load Balancer
+      VpcId: !Ref PDCVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref PDCVPCLinkSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: "-1" # all protocols
+          CidrIp: 0.0.0.0/0
+
+  PDCVPCLinkSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the VPC Link ENI (allows API Gateway to talk to NLB)
+      VpcId: !Ref PDCVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0 # API Gateway traffic enters here
+
+  PDCFargateSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Fargate containers
+      VpcId: !Ref PDCVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref PDCNLBSecurityGroup
 
   # --- Database: DynamoDB (On-Demand Pricing) ---
   PDCDonutTable:
@@ -54,6 +191,343 @@ Resources:
                   - dynamodb:Query
                   - dynamodb:Scan
                 Resource: !GetAtt PDCDonutTable.Arn
+
+  # --- IAM Role for CodeBuild ---
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser
+      Policies:
+        - PolicyName: CodeBuildLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # --- ECR Repository ---
+  PDCAppRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: pdc-app
+      ImageScanningConfiguration:
+        ScanOnPush: true # scans images for basic vulns (AWS Inspector is an add-on that does more advanced scanning)
+
+  # --- CodeBuild Project ---
+  PDCBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: pdc-app-build
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:5.0
+        Type: LINUX_CONTAINER
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: ECR_REPO_NAME
+            Value: pdc-app
+          - Name: IMAGE_TAG
+            Value: latest
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo Logging in to Amazon ECR...
+                - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+            build:
+              commands:
+                - IMAGE_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO_NAME:$IMAGE_TAG
+                - echo Build started on `date`
+                - echo Building the Docker image...
+                - docker build -t $IMAGE_URI .
+            post_build:
+              commands:
+                - echo Build completed on `date`
+                - echo Pushing the Docker image...
+                - docker push $IMAGE_URI
+                - echo Writing image definitions file...
+                - printf '[{"name":"pdc-app","imageUri":"%s"}]' $IMAGE_URI > imagedefinitions.json
+          artifacts:
+            files: imagedefinitions.json
+          cache:
+            paths:
+              - '/go/pkg/**/*'
+
+  # --- IAM Role for CodePipeline ---
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess
+      Policies:
+        - PolicyName: CodePipelinePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:*
+                  - ecs:*
+                  - codecommit:*
+                  - s3:*
+                Resource: "*"
+
+  # --- Artifact Store (S3 Bucket) for CodePipeline ---
+  PipelineArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "pdc-pipeline-artifacts-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true # blocks new public ACLs and ignores any existing public ACLs on the bucket
+        BlockPublicPolicy: true # blocks new and existing public policies on the bucket
+        IgnorePublicAcls: true # ignores any public ACLs on the bucket and objects
+        RestrictPublicBuckets: true # restricts access to the bucket to only AWS services and authed users
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LoggingConfiguration:
+        DestinationBucketName: !Ref ArtifactsLogBucket
+        LogFilePrefix: pipeline-logs/
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireArtifacts
+            Status: Enabled
+            ExpirationInDays: 3
+
+  ArtifactsLogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "pdc-pipeline-logs-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireArtifacts
+            Status: Enabled
+            ExpirationInDays: 3
+
+  # --- CodePipeline ---
+  PDCPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: pdc-app-pipeline
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref PipelineArtifactsBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Provider: GitHub
+                Version: "1"
+              Configuration:
+                Owner: benhagg
+                Repo: IS590R-ch11
+                Branch: main
+                OAuthToken: !Ref GitHubOAuthToken
+              OutputArtifacts:
+                - Name: SourceOutput
+
+        - Name: Build
+          Actions:
+            - Name: BuildAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref PDCBuildProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+
+        - Name: DeployApp
+          Actions:
+            - Name: DeployAction
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: ECS
+                Version: "1"
+              # ECS deploy reads imagedefinitions.json (container name -> image URI),
+              # creates a new task definition revision, and updates the service to it
+              Configuration:
+                ClusterName: !Ref FargateCluster
+                ServiceName: !GetAtt PDCService.Name
+                FileName: imagedefinitions.json
+              InputArtifacts:
+                - Name: BuildOutput
+
+        - Name: DeployStaticSite
+          Actions:
+            - Name: S3DeployStaticSite
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: S3
+                Version: "1"
+              Configuration:
+                BucketName: !Ref WebsiteS3
+                Extract: true
+              InputArtifacts:
+                - Name: SourceOutput
+
+  # --- IAM Role for ECS Task Execution ---
+  FargateTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: ECRAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: "*"
+
+  # --- Network Load Balancer (in private subnet, only reachable via VPC Link) ---
+  PDCNetworkLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: pdc-app-nlb
+      Type: network
+      Scheme: internal
+      Subnets:
+        - !Ref PDCPrivateSubnet
+      SecurityGroups:
+        - !Ref PDCNLBSecurityGroup
+
+  PDCTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: pdc-app-targets
+      Port: 8080
+      Protocol: TCP
+      VpcId: !Ref PDCVPC
+      TargetType: ip
+      HealthCheckEnabled: true
+      HealthCheckProtocol: TCP
+      HealthCheckPort: "8080"
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+
+  PDCNLBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref PDCNetworkLoadBalancer
+      Port: 8080
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref PDCTargetGroup
+
+  # --- HTTP API Gateway with VPC Link ---
+  # creates an ENI in the PRIVATE subnet and routes API Gateway traffic to the NLB through it
+  PDCVPCLink:
+    Type: AWS::ApiGatewayV2::VpcLink
+    Properties:
+      Name: pdc-vpc-link
+      SubnetIds:
+        - !Ref PDCPrivateSubnet # VPC Link ENI goes in private subnet
+      SecurityGroupIds:
+        - !Ref PDCNLBSecurityGroup
+
+  PDCApiGateway:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: pdc-app-api
+      ProtocolType: HTTP
+      Description: API Gateway for PDC App
+
+  PDCApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref PDCApiGateway
+      IntegrationType: HTTP_PROXY # takes the incoming request and passes it exactly as-is to NLB other options: AWS (direct to dynamo or S3), AWS_PROXY (lambda)
+      IntegrationUri: !Ref PDCNLBListener # hits the VPC dns server at 169.254.169.253 or .2 to get the private ip of the NLB
+      IntegrationMethod: ANY # which HTTP methods the API Gateway endpoint accepts.
+      PayloadFormatVersion: "1.0" # 2.0 for modern HTTP APIs (lambda only).
+      ConnectionType: VPC_LINK # used VPC Link and AWS private network to connect. Alternative is INTERNET which would require the NLB to be internet-facing and API Gateway would connect over the public internet
+      ConnectionId: !Ref PDCVPCLink
+
+  PDCApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PDCApiGateway
+      RouteKey: "ANY /{proxy+}" # any means it handles any HTTP method, {proxy+} means it matches any path
+      Target: !Sub "integrations/${PDCApiIntegration}" # links to integration id above -> NLB -> Fargate containers
+
+  PDCApiDefaultRoute: # default route for root path ("/") since {proxy+} doesn't match it
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PDCApiGateway
+      RouteKey: "$default"
+      Target: !Sub "integrations/${PDCApiIntegration}"
+
+  PDCApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref PDCApiGateway
+      StageName: prod
+      AutoDeploy: true
 
   # --- Fargate Infrastructure ---
   FargateCluster: # defines what infastructure (compute) can hold the containers. In EC2 or External mode they are attached here
@@ -96,15 +570,24 @@ Resources:
       NetworkMode: awsvpc
       Cpu: "256"
       Memory: "512"
-      TaskRoleArn: !Ref FargateTaskRole # Grants permission to talk to DynamoDB
+      TaskRoleArn: !Ref FargateTaskRole #used by application code (DynamoDB access)
+      ExecutionRoleArn: !GetAtt FargateTaskExecutionRole.Arn # used by ECS to pull image and send logs to CloudWatch
       ContainerDefinitions:
         - Name: pdc-app
-          Image: nginx:latest
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/pdc-app:latest"
           Environment:
             - Name: TABLE_NAME
               Value: !Ref PDCDonutTable
+            - Name: AWS_REGION
+              Value: !Ref "AWS::Region"
           PortMappings:
-            - ContainerPort: 80
+            - ContainerPort: 8080
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref PDCLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: pdc-app
           # HealthCheck:
           #   Command: ["CMD-SHELL", "curl -f http://localhost/health || exit 1"]
           #   Interval: 30
@@ -116,26 +599,35 @@ Resources:
 
   PDCService: # manages tasks (containers), is the control node
     Type: AWS::ECS::Service
+    DependsOn: PDCNLBListener
     Properties:
       Cluster: !Ref FargateCluster
       TaskDefinition: !Ref PDCAppTask
-      DesiredCount: 1
+      DesiredCount: 0
       LaunchType: FARGATE
       NetworkConfiguration:
         AwsvpcConfiguration:
-          AssignPublicIp: ENABLED
+          AssignPublicIp: DISABLED # Private subnet - no public IPs needed
           Subnets:
-            - !Ref PDCPublicSubnet
-      # load balancer is for EC2 launch type
-      # LoadBalancers:
-      # - ContainerName: "donut-app"
-      #   ContainerPort: 80
-      #   TargetGroupArn: !Ref PDCTargetGroup
+            - !Ref PDCPrivateSubnet # Run in private subnet
+          SecurityGroups:
+            - !Ref PDCFargateSecurityGroup
+      LoadBalancers:
+        - ContainerName: pdc-app
+          ContainerPort: 8080
+          TargetGroupArn: !Ref PDCTargetGroup
+
+  # --- CloudWatch Log Group ---
+  PDCLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/pdc-app
+      RetentionInDays: 1
 
   WebsiteS3:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: pdc-website-assets-123456789
+      BucketName: !Sub "pdc-website-assets-${AWS::AccountId}"
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true # blocks new public ACLs and ignores any existing public ACLs on the bucket
         BlockPublicPolicy: true # blocks new and existing public policies on the bucket
@@ -152,6 +644,22 @@ Resources:
         SigningBehavior: always
         SigningProtocol: sigv4
 
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteS3
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${WebsiteS3.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${WebCloudFront}"
+
   WebCloudFront:
     Type: AWS::CloudFront::Distribution
     Properties:
@@ -160,7 +668,7 @@ Resources:
           - Id: S3Origin
             DomainName: !GetAtt WebsiteS3.RegionalDomainName
             OriginAccessControlId: !Ref CloudFrontOAC # limits access to the S3 bucket to the cloudfront distribution authorized by the OAC
-            # S3OriginConfig:
+            S3OriginConfig: {}
         Enabled: true
         DefaultRootObject: index.html # serve index.html file when hitting the S3 bucket URL
         DefaultCacheBehavior:
@@ -172,7 +680,38 @@ Resources:
           CachedMethods:
             - GET
             - HEAD
-          ForwardedValues:
-            QueryString: false
-            Cookies:
-              Forward: none
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # Managed-CachingOptimized policy
+
+Outputs:
+  ECRRepositoryURL:
+    Description: ECR Repository URL for Docker images
+    Value: !GetAtt PDCAppRepository.RepositoryUri
+    Export:
+      Name: PDCECRRepositoryURI
+
+  CodePipelineURL:
+    Description: CodePipeline console URL
+    Value: !Sub "https://console.aws.amazon.com/codepipeline/home?region=${AWS::Region}#/view/${PDCPipeline}"
+
+  DynamoDBTableName:
+    Description: DynamoDB table name
+    Value: !Ref PDCDonutTable
+
+  ECSClusterName:
+    Description: ECS Cluster name
+    Value: !Ref FargateCluster
+
+  ECSServiceName:
+    Description: ECS Service name
+    Value: !GetAtt PDCService.Name
+
+  CloudFrontURL:
+    Description: CloudFront distribution URL for website
+    Value: !GetAtt WebCloudFront.DomainName
+  APIGatewayEndpoint:
+    Description: HTTP API Gateway endpoint URL
+    Value: !Sub "https://${PDCApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod"
+
+  NetworkLoadBalancerDNS:
+    Description: Network Load Balancer DNS name
+    Value: !GetAtt PDCNetworkLoadBalancer.DNSName
