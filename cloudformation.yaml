@@ -216,6 +216,7 @@ Resources:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                   - s3:GetObject
+                  - s3:PutObject
                 Resource: "*"
 
   # --- ECR Repository ---
