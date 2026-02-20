@@ -16,11 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
-// responseItem is a type alias for map[string]interface{}
-// In Go, you can create custom types from existing types.
-// This allows us to use responseItem as shorthand and potentially add methods to it later.
-// map[string]interface{} is Go's way of handling dynamic/flexible data structures
-// (like dict in Python or object in JavaScript)
+// map[string]interface{} says keys are strings, values can be any type.
 type responseItem map[string]interface{}
 
 // apiResponse is a struct (Go's equivalent of a class/object with fixed fields)
@@ -32,43 +28,32 @@ type apiResponse struct {
 }
 
 func main() {
-	// os.Getenv() reads environment variables (like ENVVAR from Docker or CloudFormation)
 	tableName := os.Getenv("TABLE_NAME")
 	if tableName == "" {
 		// log.Fatal() prints error and exits the program immediately
-		// Go idiom: check errors early and exit immediately if critical
 		log.Fatal("TABLE_NAME is required")
 	}
 
 	region := os.Getenv("AWS_REGION")
 	if region == "" {
-		// Provide a sensible default if env var not set (Go idiom for optional config)
 		region = "us-east-1"
 	}
 
 	storeID := os.Getenv("STORE_ID")
 
-	// context.Background() creates a root context for timeout/cancellation management
-	// This is Go's way of handling request cancellation and timeouts across goroutines
 	// config.LoadDefaultConfig() loads AWS credentials from environment (IAM role in Fargate)
 	cfg, err := config.LoadDefaultConfig(context.Background(), config.WithRegion(region))
 	if err != nil {
-		// Go idiom: multiple return values, last one is usually error
-		// log.Fatalf() formats a string like printf, then exits
 		log.Fatalf("failed to load AWS config: %v", err)
 	}
 
-	// Create a DynamoDB client from the config
-	// Go uses package-level functions to create clients (no constructor pattern)
+	// dynamodb is the package name for "github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	// this creates a DynamoDB client.
 	client := dynamodb.NewFromConfig(cfg)
 
-	// http.NewServeMux() is like Express.js - a router for HTTP requests
-	// Mux = Multiplexer (routes requests to appropriate handlers)
+	// http router
 	mux := http.NewServeMux()
 	
-	// mux.HandleFunc() registers a route with a handler function
-	// The handler is an anonymous function (closure) that captures 'client' and 'tableName'
-	// (w http.ResponseWriter, r *http.Request) are the standard Go HTTP handler parameters
 	// Note the receiver parameters: w is passed by value, r is passed by pointer (*)
 	mux.HandleFunc("/items", func(w http.ResponseWriter, r *http.Request) {
 		// CORS headers - allow requests from any origin (frontend can call this API)
@@ -76,39 +61,37 @@ func main() {
 		
 		// Handle CORS preflight requests (browser sends OPTIONS before GET/POST)
 		if r.Method == http.MethodOptions {
+			// sends 204 response, CORS headers, no respose body. tells browser it's ok to proceed with actual request with these specific http methods.
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 
 		// Only allow GET requests; reject everything else
 		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed) 
 			return
 		}
-
-		// r.URL.Query().Get("itemIds") extracts query parameter like ?itemIds=1,2,3
-		// Returns empty string if not found
+	
+		// := is Go's short variable declaration (only in functions)
+		// Declares and initializes var in one line
 		ids := parseItemIDs(r.URL.Query().Get("itemIds"))
 		if len(ids) == 0 {
 			http.Error(w, "itemIds is required", http.StatusBadRequest)
 			return
 		}
 
-		// context.WithTimeout() creates a child context with a 5-second timeout
-		// This cancels any long-running operations (DynamoDB queries) after 5 seconds
-		// defer cancel() ensures cancel() is called when this function exits (cleanup pattern)
+
+		// any queries > 5 sec are canceled, if a query is returned before then the defer keyword ensures that cancel() is immediately called to free resources. This is a common Go pattern for managing timeouts and cancellations.
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 
-		// := is Go's short variable declaration (only in functions)
-		// Declares and initializes var in one line
+
 		var items []responseItem
 		
 		// Conditional logic: use batch query if storeID provided, otherwise scan all items
 		if storeID != "" {
 			items, err = batchGetItems(ctx, client, tableName, storeID, ids)
 		} else {
-			// := assigns a new value, err is reassigned here
 			items, err = scanByItemIDs(ctx, client, tableName, ids)
 		}
 
@@ -120,7 +103,6 @@ func main() {
 		}
 
 		// Create response object using the struct defined at top
-		// Go allows creating struct instances with field names: FieldName: value
 		resp := apiResponse{ItemIDs: ids, Items: items}
 		
 		// Set content-type header before writing body
