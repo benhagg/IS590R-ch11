@@ -1,4 +1,4 @@
-FROM golang:1.26.0-alpine3.23 AS builder
+FROM public.ecr.aws/docker/library/golang:1.26.0-alpine3.23 AS builder
 
 WORKDIR /app
 COPY go.mod ./
