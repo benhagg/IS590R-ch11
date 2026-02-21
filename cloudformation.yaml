@@ -63,7 +63,7 @@ Resources:
       MapPublicIpOnLaunch: false # Private subnet - no public IPs
       AvailabilityZone: !Select [0, !GetAZs ""]
 
-  # --- Elastic IP for NAT Gateway ---
+  # --- Elastic IP for NAT Gateway --- # if we wanted stuff in the private subnets to access the internet. (we just need them to hit ECR so we are using an interface endpoint)
   # PDCNATGatewayEIP:
   #   Type: AWS::EC2::EIP
   #   DependsOn: AttachGateway
@@ -77,12 +77,6 @@ Resources:
   #     AllocationId: !GetAtt PDCNATGatewayEIP.AllocationId
   #     SubnetId: !Ref PDCPublicSubnet # NAT must be in public subnet
 
-  # --- Route Table for Private Subnet ---
-  PDCPrivateRouteTable:
-    Type: AWS::EC2::RouteTable
-    Properties:
-      VpcId: !Ref PDCVPC
-
   # Route private subnet traffic to NAT Gateway (for ECR pulls, CloudWatch logs)
   # PDCPrivateRoute:
   #   Type: AWS::EC2::Route
@@ -90,6 +84,88 @@ Resources:
   #     RouteTableId: !Ref PDCPrivateRouteTable
   #     DestinationCidrBlock: 0.0.0.0/0
   #     NatGatewayId: !Ref PDCNATGateway #forward all private subnet traffic to NAT for internet access
+
+  PVCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for VPC Interface Endpoints
+      VpcId: !Ref PDCVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref PDCFargateSecurityGroup # Allows Fargate to "talk in"
+
+  PDCFargateSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Fargate containers
+      VpcId: !Ref PDCVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref PDCNLBSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0 # Allows the task to reach the Endpoints
+
+  # --- Interface Endpoint for (ECS Task -> ECR) --- #
+  # AWS handles the routing of requests from the private subnet to the ECR service through this endpoint
+  ECREndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true # allows us to use the normal ECR endpoint URLs and have them resolve to the VPC endpoint rather than going out to the public internet
+      VpcEndpointType: Interface # (Interface / Gateway) defaults to Gateway, both interface and gateway use AWS::EC2::VPCEndpoint
+      VpcId: !Ref PDCVPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ecr.api" # ECR API endpoint for this region
+      SubnetIds:
+        - !Ref PDCPrivateSubnet # only tasks in private subnet need this endpoint
+      SecurityGroupIds:
+        - !Ref PVCEndpointSecurityGroup # allow ECS tasks to talk to this endpoint
+
+  ECRDockerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true # allows us to use the normal ECR endpoint URLs and have them resolve to the VPC endpoint rather than going out to the public internet
+      VpcEndpointType: Interface
+      VpcId: !Ref PDCVPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ecr.dkr" # allows docker commands
+      SubnetIds:
+        - !Ref PDCPrivateSubnet
+      SecurityGroupIds:
+        - !Ref PVCEndpointSecurityGroup
+
+  # --- S3 Gateway Endpoint --- # for getting ECR images
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref PDCVPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3" # ecr images stored on S3
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PDCPrivateRouteTable
+
+  # --- Interface Endpoint for CloudWatch Logs (ECS Task -> CloudWatch) --- #
+  LogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      VpcEndpointType: Interface
+      VpcId: !Ref PDCVPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.logs"
+      SubnetIds:
+        - !Ref PDCPrivateSubnet
+      SecurityGroupIds:
+        - !Ref PVCEndpointSecurityGroup
+
+  # --- Route Table for Private Subnet ---
+  PDCPrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref PDCVPC
 
   PDCPrivateSubnetRouteTableAssociation:
     Type: AWS::EC2::SubnetRouteTableAssociation
@@ -101,6 +177,7 @@ Resources:
   PDCDynamoDBEndpoint:
     Type: AWS::EC2::VPCEndpoint
     Properties:
+      # VpcEndpointType: Gateway #  (Interface / Gateway) defaults to Gateway, both interface and gateway use AWS::EC2::VPCEndpoint
       VpcId: !Ref PDCVPC
       ServiceName: !Sub "com.amazonaws.${AWS::Region}.dynamodb" # DynamoDB endpoint for this region
       RouteTableIds:
@@ -116,43 +193,6 @@ Resources:
               - dynamodb:Scan
               - dynamodb:BatchGetItem
             Resource: !GetAtt PDCDonutTable.Arn
-
-  # --- Security Groups ---
-  PDCNLBSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: Security group for Network Load Balancer
-      VpcId: !Ref PDCVPC
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 8080
-          ToPort: 8080
-          SourceSecurityGroupId: !Ref PDCVPCLinkSecurityGroup
-      SecurityGroupEgress:
-        - IpProtocol: "-1" # all protocols
-          CidrIp: 0.0.0.0/0
-
-  PDCVPCLinkSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: Security group for the VPC Link ENI (allows API Gateway to talk to NLB)
-      VpcId: !Ref PDCVPC
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 8080
-          ToPort: 8080
-          CidrIp: 0.0.0.0/0 # API Gateway traffic enters here
-
-  PDCFargateSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: Security group for Fargate containers
-      VpcId: !Ref PDCVPC
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 8080
-          ToPort: 8080
-          SourceSecurityGroupId: !Ref PDCNLBSecurityGroup
 
   # --- Database: DynamoDB (On-Demand Pricing) ---
   PDCDonutTable:
@@ -225,7 +265,7 @@ Resources:
     Properties:
       RepositoryName: pdc-app
       ImageScanningConfiguration:
-        ScanOnPush: true # scans images for basic vulns (AWS Inspector is an add-on that does more advanced scanning)
+        ScanOnPush: false # scans images for basic vulns (AWS Inspector is an add-on that does more advanced scanning)
 
   # --- CodeBuild Project ---
   PDCBuildProject:
@@ -491,7 +531,33 @@ Resources:
       SubnetIds:
         - !Ref PDCPrivateSubnet # VPC Link ENI goes in private subnet
       SecurityGroupIds:
-        - !Ref PDCNLBSecurityGroup
+        - !Ref PDCVPCLinkSecurityGroup
+
+  # --- Security Groups ---
+  PDCNLBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Network Load Balancer
+      VpcId: !Ref PDCVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref PDCVPCLinkSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: "-1" # all protocols
+          CidrIp: 0.0.0.0/0
+
+  PDCVPCLinkSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the VPC Link ENI (allows API Gateway to talk to NLB)
+      VpcId: !Ref PDCVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0 # API Gateway traffic enters here
 
   PDCApiGateway:
     Type: AWS::ApiGatewayV2::Api
@@ -606,7 +672,7 @@ Resources:
     Properties:
       Cluster: !Ref FargateCluster
       TaskDefinition: !Ref PDCAppTask
-      DesiredCount: 0
+      DesiredCount: 1
       LaunchType: FARGATE
       NetworkConfiguration:
         AwsvpcConfiguration:
@@ -712,6 +778,7 @@ Outputs:
   CloudFrontURL:
     Description: CloudFront distribution URL for website
     Value: !GetAtt WebCloudFront.DomainName
+
   APIGatewayEndpoint:
     Description: HTTP API Gateway endpoint URL
     Value: !Sub "https://${PDCApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod"
