@@ -511,6 +511,11 @@ Resources:
       HealthCheckIntervalSeconds: 30
       HealthyThresholdCount: 2
       UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - Key: proxy_protocol_v2.enabled
+          Value: "false"
+        - Key: preserve_client_ip.enabled
+          Value: "false"
 
   PDCNLBListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
@@ -534,30 +539,76 @@ Resources:
         - !Ref PDCVPCLinkSecurityGroup
 
   # --- Security Groups ---
+  # PDCNLBSecurityGroup:
+  #   Type: AWS::EC2::SecurityGroup
+  #   Properties:
+  #     GroupDescription: Security group for Network Load Balancer
+  #     VpcId: !Ref PDCVPC
+  #     SecurityGroupIngress:
+  #       - IpProtocol: tcp
+  #         FromPort: 8080
+  #         ToPort: 8080
+  #         SourceSecurityGroupId: !Ref PDCVPCLinkSecurityGroup
+  #     SecurityGroupEgress:
+  #       - IpProtocol: "-1" # all protocols
+  #         CidrIp: 0.0.0.0/0
+
+  # PDCVPCLinkSecurityGroup:
+  #   Type: AWS::EC2::SecurityGroup
+  #   Properties:
+  #     GroupDescription: Security group for the VPC Link ENI (allows API Gateway to talk to NLB)
+  #     VpcId: !Ref PDCVPC
+  #     SecurityGroupIngress:
+  #       - IpProtocol: tcp
+  #         FromPort: 8080
+  #         ToPort: 8080
+  #         CidrIp: 0.0.0.0/0 # API Gateway traffic enters here
+  #     SecurityGroupEgress: # this is required to talk to the NLB
+  #       - IpProtocol: tcp
+  #         FromPort: 8080
+  #         ToPort: 8080
+  #         DestinationSecurityGroupId: !Ref PDCNLBSecurityGroup
+
   PDCNLBSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: Security group for Network Load Balancer
       VpcId: !Ref PDCVPC
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 8080
-          ToPort: 8080
-          SourceSecurityGroupId: !Ref PDCVPCLinkSecurityGroup
+      # ONLY keep rules that don't point to the VPC Link Group here
       SecurityGroupEgress:
-        - IpProtocol: "-1" # all protocols
+        - IpProtocol: "-1"
           CidrIp: 0.0.0.0/0
 
   PDCVPCLinkSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Security group for the VPC Link ENI (allows API Gateway to talk to NLB)
+      GroupDescription: Security group for the VPC Link ENI
       VpcId: !Ref PDCVPC
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 8080
           ToPort: 8080
-          CidrIp: 0.0.0.0/0 # API Gateway traffic enters here
+          CidrIp: 0.0.0.0/0
+
+  # This allows the VPC Link to talk TO the NLB
+  VPCLinkToNLBEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref PDCVPCLinkSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      DestinationSecurityGroupId: !Ref PDCNLBSecurityGroup
+
+  # This allows the NLB to accept traffic FROM the VPC Link
+  NLBFromVPCLinkIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref PDCNLBSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref PDCVPCLinkSecurityGroup
 
   PDCApiGateway:
     Type: AWS::ApiGatewayV2::Api

@@ -1,3 +1,3 @@
 window.APP_CONFIG = {
-  apiBaseUrl: "http//localhost:8080"
+  apiBaseUrl: "https://qr2zl1vwp3.execute-api.us-west-2.amazonaws.com/prod"
 };

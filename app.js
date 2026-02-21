@@ -3,7 +3,7 @@ const API_ENDPOINT = window.APP_CONFIG?.apiBaseUrl || "http://localhost:8080";
 
 async function fetchAndShowAllDonuts() {
   try {
-    const response = await fetch(`http://localhost:8080/all_donuts`);
+    const response = await fetch(`${API_ENDPOINT}/all_donuts`);
     const donuts = await response.json();
     const donutList = document.getElementById("donut-list");
     donutList.innerHTML = "";
