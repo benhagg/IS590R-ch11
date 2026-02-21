@@ -627,6 +627,8 @@ Resources:
       PayloadFormatVersion: "1.0" # 2.0 for modern HTTP APIs (lambda only).
       ConnectionType: VPC_LINK # used VPC Link and AWS private network to connect. Alternative is INTERNET which would require the NLB to be internet-facing and API Gateway would connect over the public internet
       ConnectionId: !Ref PDCVPCLink
+      RequestParameters:
+        "overwrite:path": "$request.path" # passes the full path through but removes the stage name (/prod)
 
   PDCApiRoute:
     Type: AWS::ApiGatewayV2::Route
